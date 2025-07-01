@@ -5,11 +5,15 @@
 use std::hint::black_box;
 
 use iai_callgrind::{library_benchmark, library_benchmark_group, main};
-use libm::support::{HInt, Hexf, hf16, hf32, hf64, hf128, u256};
+use libm::support::{DInt, HInt, Hexf, hf16, hf32, hf64, hf128, u256};
 use libm_test::generate::spaced;
-use libm_test::{CheckBasis, CheckCtx, GeneratorKind, MathOp, OpRustArgs, TupleCall, op};
+use libm_test::{CheckBasis, CheckCtx, GeneratorKind, MathOp, TupleCall, op};
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha8Rng;
 
 const BENCH_ITER_ITEMS: u64 = 500;
+
+type TestCases<Op> = Vec<(<Op as MathOp>::RustArgs, <Op as MathOp>::RustRet)>;
 
 macro_rules! icount_benches {
     (
@@ -18,7 +22,7 @@ macro_rules! icount_benches {
     ) => {
         paste::paste! {
             // Construct benchmark inputs from the logspace generator.
-            fn [< setup_ $fn_name >]() -> Vec<OpRustArgs<op::$fn_name::Routine>> {
+            fn [< setup_ $fn_name >]() -> TestCases<op::$fn_name::Routine> {
                 type Op = op::$fn_name::Routine;
                 let mut ctx = CheckCtx::new(
                     Op::IDENTIFIER,
@@ -26,7 +30,9 @@ macro_rules! icount_benches {
                     GeneratorKind::Spaced
                 );
                 ctx.override_iterations(BENCH_ITER_ITEMS);
-                let ret = spaced::get_test_cases::<Op>(&ctx).0.collect::<Vec<_>>();
+                let ret = spaced::get_test_cases::<Op>(&ctx).0
+                    .map(|args| (args, Default::default()))
+                    .collect::<Vec<_>>();
                 println!("operation {}, {} steps", Op::NAME, ret.len());
                 ret
             }
@@ -34,12 +40,15 @@ macro_rules! icount_benches {
             // Run benchmarks with the above inputs.
             #[library_benchmark]
             #[bench::logspace([< setup_ $fn_name >]())]
-            fn [< icount_bench_ $fn_name >](cases: Vec<OpRustArgs<op::$fn_name::Routine>>) {
+            fn [< icount_bench_ $fn_name >](
+                mut cases: TestCases<op::$fn_name::Routine>
+            ) -> TestCases<op::$fn_name::Routine> {
                 type Op = op::$fn_name::Routine;
                 let f = black_box(Op::ROUTINE);
-                for input in cases.iter().copied() {
-                    input.call(f);
+                for (input, output) in cases.iter_mut() {
+                    *output = input.call(f);
                 }
+                cases
             }
 
             library_benchmark_group!(
@@ -55,92 +64,79 @@ libm_macros::for_each_function! {
 }
 
 fn setup_u128_mul() -> Vec<(u128, u128)> {
-    let step = u128::MAX / 300;
-    let mut x = 0u128;
-    let mut y = 0u128;
-    let mut v = Vec::new();
-
-    loop {
-        'inner: loop {
-            match y.checked_add(step) {
-                Some(new) => y = new,
-                None => break 'inner,
-            }
-
-            v.push((x, y))
-        }
-
-        match x.checked_add(step) {
-            Some(new) => x = new,
-            None => break,
-        }
-    }
-
-    v
+    let mut rng = ChaCha8Rng::seed_from_u64(0);
+    Vec::from_iter((0..BENCH_ITER_ITEMS).map(|_| (rng.random(), rng.random())))
 }
 
 fn setup_u256_add() -> Vec<(u256, u256)> {
-    let mut v = Vec::new();
-    for (x, y) in setup_u128_mul() {
-        // square the u128 inputs to cover most of the u256 range
-        v.push((x.widen_mul(x), y.widen_mul(y)));
-    }
-    // Doesn't get covered by `u128:MAX^2`
-    v.push((u256::MAX, u256::MAX));
-    v
+    let mut rng = ChaCha8Rng::seed_from_u64(0);
+    Vec::from_iter((0..BENCH_ITER_ITEMS).map(|_| {
+        (
+            u256::from_lo_hi(rng.random(), rng.random()),
+            u256::from_lo_hi(rng.random(), rng.random()),
+        )
+    }))
 }
 
-fn setup_u256_shift() -> Vec<(u256, u32)> {
-    let mut v = Vec::new();
-
-    for (x, _) in setup_u128_mul() {
-        let x2 = x.widen_mul(x);
-        for y in 0u32..256 {
-            v.push((x2, y));
-        }
-    }
-
-    v
+fn setup_u256_shift(s: std::ops::Range<u32>) -> Vec<(u256, u32)> {
+    let mut rng = ChaCha8Rng::seed_from_u64(0);
+    Vec::from_iter((0..BENCH_ITER_ITEMS).map(|_| {
+        (
+            u256::from_lo_hi(rng.random(), rng.random()),
+            rng.random_range(s.start..s.end),
+        )
+    }))
 }
 
 #[library_benchmark]
 #[bench::linspace(setup_u128_mul())]
-fn icount_bench_u128_widen_mul(cases: Vec<(u128, u128)>) {
-    for (x, y) in cases.iter().copied() {
-        black_box(black_box(x).zero_widen_mul(black_box(y)));
+fn icount_bench_u128_widen_mul(mut cases: Vec<(u128, u128)>) -> Vec<(u128, u128)> {
+    for (x, y) in cases.iter_mut() {
+        (*x, *y) = x.widen_mul(*y).lo_hi();
     }
+    cases
 }
 
 #[library_benchmark]
 #[bench::linspace(setup_u256_add())]
-fn icount_bench_u256_add(cases: Vec<(u256, u256)>) {
-    for (x, y) in cases.iter().copied() {
-        black_box(black_box(x) + black_box(y));
+fn icount_bench_u256_add(mut cases: Vec<(u256, u256)>) -> Vec<(u256, u256)> {
+    for (x, y) in cases.iter_mut() {
+        *x = *x + *y;
     }
+    cases
 }
 
 #[library_benchmark]
 #[bench::linspace(setup_u256_add())]
-fn icount_bench_u256_sub(cases: Vec<(u256, u256)>) {
-    for (x, y) in cases.iter().copied() {
-        black_box(black_box(x) - black_box(y));
+fn icount_bench_u256_sub(mut cases: Vec<(u256, u256)>) -> Vec<(u256, u256)> {
+    for (x, y) in cases.iter_mut() {
+        *x = *x - *y;
     }
+    cases
 }
 
 #[library_benchmark]
-#[bench::linspace(setup_u256_shift())]
-fn icount_bench_u256_shl(cases: Vec<(u256, u32)>) {
-    for (x, y) in cases.iter().copied() {
-        black_box(black_box(x) << black_box(y));
+#[benches::linspace(
+    args = [0..64, 64..128, 128..192, 192..256],
+    setup = setup_u256_shift
+)]
+fn icount_bench_u256_shl(mut cases: Vec<(u256, u32)>) -> Vec<(u256, u32)> {
+    for (x, y) in cases.iter_mut() {
+        *x = *x << *y;
     }
+    cases
 }
 
 #[library_benchmark]
-#[bench::linspace(setup_u256_shift())]
-fn icount_bench_u256_shr(cases: Vec<(u256, u32)>) {
-    for (x, y) in cases.iter().copied() {
-        black_box(black_box(x) >> black_box(y));
+#[benches::linspace(
+    args = [0..64, 64..128, 128..192, 192..256],
+    setup = setup_u256_shift
+)]
+fn icount_bench_u256_shr(mut cases: Vec<(u256, u32)>) -> Vec<(u256, u32)> {
+    for (x, y) in cases.iter_mut() {
+        *x = *x >> *y;
     }
+    cases
 }
 
 library_benchmark_group!(
